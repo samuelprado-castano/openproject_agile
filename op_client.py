@@ -88,7 +88,7 @@ class OpenProjectClient:
              return [{"id": t["id"], "name": t["name"]} for t in response.json().get("_embedded", {}).get("elements", [])]
         return []
 
-    def create_work_package(self, project_id, subject, type_id, estimated_hours=None, description=None, due_date=None):
+    def create_work_package(self, project_id, subject, type_id, estimated_hours=None, description=None, due_date=None, retry=True):
         """Creates a new work package."""
         if not self.is_configured(): return None
         url = f"{self.base_url}/api/v3/work_packages"
@@ -118,11 +118,47 @@ class OpenProjectClient:
              payload["description"] = {"format": "markdown", "raw": description}
 
         response = requests.post(url, headers=self._get_headers(), json=payload)
+        
         if response.status_code in [200, 201]:
             return response.json()
         elif response.status_code == 404:
              print(f"404 Error: Project or Type not found. ProjectID: {project_id}, TypeID: {type_id}")
              print(response.text)
+        elif response.status_code == 403 and retry:
+             # Check if it is a permission issue that we can fix by adding the member
+             # Sometimes 403 is returned for permission issues, but typical for this specific case is 422 with PropertyConstraintViolation
+             pass 
+        elif response.status_code == 422 and retry:
+             # Handle "User not a member" error (PropertyConstraintViolation on assignee)
+             try:
+                 error_data = response.json()
+                 if error_data.get("errorIdentifier") == "urn:openproject-org:api:v3:errors:PropertyConstraintViolation" and \
+                    error_data.get("_embedded", {}).get("details", {}).get("attribute") == "assignee":
+                     
+                     print("User is not a member of the project. Attempting to join...")
+                     
+                     # 1. Get Me ID
+                     if me:
+                         user_id = me["id"]
+                         
+                         # 2. Add as member (Role ID 3 = Miembro by default)
+                         # We could fetch roles to find "Miembro", but ID 3 is fairly standard. 
+                         # Let's try to be robust and find "Miembro" or fallback to 3.
+                         role_id = 3
+                         roles = self.get_roles()
+                         for r in roles:
+                             if r["name"] == "Miembro":
+                                 role_id = r["id"]
+                                 break
+                         
+                         if self.add_member(project_id, user_id, role_id):
+                             print("Successfully joined project. Retrying creation...")
+                             return self.create_work_package(project_id, subject, type_id, estimated_hours, description, due_date, retry=False)
+                         else:
+                             print("Failed to auto-join project.")
+             except Exception as e:
+                 print(f"Error handling auto-join: {e}")
+
         else:
             print(f"Error creating WP: {response.text}")
         return None
@@ -400,3 +436,32 @@ class OpenProjectClient:
                 if name.lower() in status["name"].lower():
                     return status["id"]
         return None
+
+    def get_roles(self):
+        """Fetches all available roles."""
+        if not self.is_configured(): return []
+        url = f"{self.base_url}/api/v3/roles"
+        response = requests.get(url, headers=self._get_headers())
+        if response.status_code == 200:
+            return [{"id": r["id"], "name": r["name"]} for r in response.json().get("_embedded", {}).get("elements", [])]
+        return []
+
+    def add_member(self, project_id, user_id, role_id):
+        """Adds a user to a project with a specific role."""
+        if not self.is_configured(): return False
+        url = f"{self.base_url}/api/v3/memberships"
+        
+        payload = {
+            "_links": {
+                "project": {"href": f"/api/v3/projects/{project_id}"},
+                "principal": {"href": f"/api/v3/users/{user_id}"},
+                "roles": [{"href": f"/api/v3/roles/{role_id}"}]
+            }
+        }
+        
+        response = requests.post(url, headers=self._get_headers(), json=payload)
+        if response.status_code in [200, 201]:
+            return True
+        else:
+            print(f"Error adding member: {response.status_code} - {response.text}")
+            return False
